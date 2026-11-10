@@ -1,0 +1,4 @@
+model,rmse,r2
+baseline,3.79,0.844
+full,1.72,0.968
+tuned,1.72,0.968

@@ -79,8 +79,13 @@ def part1a_zone_windows():
     in batch over all the files, so that you can see what the watermark did.
     """
     rides = read_rides()
-    # TODO
-    return None
+    zoneWindows = (
+        rides.withWatermark("event_time", "3 minutes").groupBy(window(col("event_time"), "5 minutes"), "pickup_zone")
+        .agg(count("*").alias("trips"), sround(ssum("fare"), 2).alias("revenue"),)
+        .select(col("window.start").alias("window_start"), col("window.end").alias("window_end"),
+                "pickup_zone", "trips", "revenue")
+    )
+    return zoneWindows.writeStream.format("parquet").outputMode("append").option("checkpointLocation", ckpt_dir).trigger(availableNow=True).start(out_dir)
 
 
 # ---------------------------------------------------------------- Part 1b: alerts
@@ -93,8 +98,12 @@ def part1b_alerts():
     """
     from pyspark.sql.functions import when
     rides = read_rides()
-    # TODO
-    return None
+    highFare = col("fare") > 150
+    zeroDistance = col("distance_km") == 0
+    alerts = (rides.filter(highFare | zeroDistance).withColumn("reason", when(highFare, "high_fare").otherwise("zero_distance"))
+              .select("ride_id", "event_time", "pickup_zone", "distance_km", "duration_min", "fare", "reason",))
+    return alerts.writeStream.format("csv").outputMode("append").option("header", True).option("timestampFormat", "yyy-MM-dd HH:mm:ss").option("checkpointLocation", ckpt_dir).trigger(availableNow=True).start(out_dir)
+
 
 
 # ---------------------------------------------------------------- Part 2: the fare model
@@ -140,9 +149,28 @@ def part2_train():
         print(f"{name:10s} RMSE {rmse:6.2f}   R2 {r2:6.3f}")
         results.append((name, round(rmse, 2), round(r2, 3))); models[name] = model
 
-    # TODO: baseline, full, tuned (with ParamGridBuilder and CrossValidator); evaluate(...)
-    #       each; save models[<best name>] under model_dir; return results
-    return None
+    baseline = Pipeline(stages=[VectorAssembler(inputCols=["distance_km"], outputCol="features"),
+                                LinearRegression(labelCol="fare"),])
+    evaluate("baseline", baseline.fit(trainDF))
+    categories = ["zone", "payment_type", "hour"]
+    indexCols = [f"{name}_idx" for name in categories]
+    encodedCols = [f"{name}_ohe" for name in categories]
+    indexer = StringIndexer(inputCols = categories, outputCols=indexCols, handleInvalid="keep",)
+    encoder = OneHotEncoder(inputCols=indexCols, outputCols=encodedCols)
+    assembler = VectorAssembler(inputCols=encodedCols+["distance_km", "duration_min"], outputCol = "features",)
+    featureStages = [indexer, encoder, assembler]
+    full = Pipeline(stages=featureStages + [LinearRegression(labelCol="fare")])
+    evaluate("full", full.fit(trainDF))
+    tuned_lr = LinearRegression(labelCol="fare")
+    tuned = Pipeline(stages=featureStages+[tuned_lr])
+    paramGrid = ParamGridBuilder().addGrid(tuned_lr.regParam, [0.01,0.1]).build()
+    cv = CrossValidator(estimator = tuned, estimatorParamMaps=paramGrid, evaluator=rmse_eval, numFolds=3, parallelism=2,seed=seed,)
+    cvModel = cv.fit(trainDF)
+    evaluate("tuned", cvModel.bestModel)
+    bestName = min(models, key=lambda name: rmse_eval.evaluate(models[name].transform(testDF)))
+    models[bestName].write().overwrite().save(model_dir)
+    trainDF.unpersist()
+    return results
 
 
 # ---------------------------------------------------------------- Part 3: score the stream
@@ -155,8 +183,13 @@ def part3_score(threshold):
     with the timestampFormat option of part 1b. Trigger availableNow, checkpoint in
     ckpt_dir. Return the started query. No fit() anywhere in this function.
     """
-    # TODO
-    return None
+    model = PipelineModel.load(model_dir)
+    rides = features_of(read_rides(), "event_time")
+    flagged = (model.transform(rides).withColumn("deviation", sround(sabs(col("fare") - col("prediction")), 2))
+               .filter(col("deviation") > threshold)
+               .select("ride_id", "event_time", "pickup_zone", "distance_km", "duration_min", "payment_type", "fare", sround(col("prediction"), 2).alias("prediction"), "deviation"))
+    return flagged.writeStream.format("csv").outputMode("append").option("header", True).option("timestampFormat", "yyyy-MM-dd HH:mm:ss").option("checkpointLocation", ckpt_dir).trigger(availableNow=True).start(out_dir)
+
 
 
 # ---------------------------------------------------------------- main
